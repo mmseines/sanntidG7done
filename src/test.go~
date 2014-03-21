@@ -1,0 +1,29 @@
+package main
+
+import (
+    //"iomodule" 
+    "fmt"
+    //"heis"
+    "driver"
+    //"encoding/json"
+    //"net"
+   // "time"
+)
+
+
+
+func main(){
+
+
+/*
+	c, err := net.Dial("tcp","google.com:80")
+	if err != nil {
+		fmt.Println("kakakak ", err) 
+	}else{
+		buffer := make([]byte, 128)
+		c.Read(buffer)
+	}
+	
+*/
+}
+

@@ -1,0 +1,44 @@
+package iomodule
+
+import(
+   "driver"
+   //"fmt"
+//   "time"
+)
+
+func IoTest(order_queue [8]int, command_list [8]int, order_list [8]int, cost [8]int)([8]int, [8]int){
+   //for {
+      
+      
+      //fmt.Printf("begynner for loop io \n")
+      i:= 0
+      for i<4{
+         if driver.GetButtonSignal("command", i) == 1{
+            command_list[i] = 1
+         } 
+         if driver.GetButtonSignal("down", i) == 1{
+            order_list[2*i] = 1
+         }
+         if driver.GetButtonSignal("up", i) == 1{
+            order_list[2*i + 1] =driver.GetButtonSignal("up", i)
+         }
+         i += 1
+         
+      }
+      
+      
+      i = 0 
+      for (i < 4){
+         driver.SetButtonLamp("command", i, command_list[i])
+         if (i > 0){   
+            driver.SetButtonLamp("down", i , order_list[i*2])
+         }
+         if (i < 3){
+            driver.SetButtonLamp("up", i, order_list[i*2+1])
+         }
+         i += 1
+      }
+      return command_list, order_list
+   //}
+
+}

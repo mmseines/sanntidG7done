@@ -1,0 +1,404 @@
+package network
+
+import (
+    "fmt"
+    "driver" 
+	"net"
+	"time"
+	"strings"
+	"encoding/json"
+	"strconv"
+)
+
+type informationPkg struct{
+	Cost [8]int
+	OrderQueue [8]int
+	RemoveOrder [8]int
+}
+
+
+func Network(order_queue chan driver.Data ,remove_order chan driver.Data ,cost chan driver.Data, elevator_number chan int, order_list chan driver.Data, order_list_lights chan driver.Data){
+	var (
+		order_queue_array 	[10]driver.Data // Array for storing data
+		cost_array 			[10]driver.Data // Array for storing data
+		remove_order_array 	[10]driver.Data // Array for storing data 
+		pkg 				informationPkg 	// Struct for sending information from slave to master
+	
+	)
+	backup 					:= driver.DataInit()
+	global_order_list 		:= driver.DataInit()
+	connection_timeouts 	:= [10]int{0,0,0,0,0,0,0,0,0,0}
+	const master_index 		 = 0
+	const local_index	 	 = 0	
+
+	//initialize
+	ip, master_port, master_ip_reader, master_ip_writer, broadcast_orders, recieve_orders, err := Init()
+	fmt.Println("Init sucessfull. this elevators ip is: ", ip)
+	
+	if err != nil{return}
+ 
+	go func(){
+		for{
+			select{
+			case data := <- remove_order:
+				remove_order_array[local_index] = data
+			case data := <- order_queue:
+				i := 0
+				for i < 8{
+					if data.Array[i] == 1{
+						order_queue_array[local_index].Array[i] = 1
+					}
+					i += 1
+				}
+			case data := <- cost:
+				cost_array[local_index] = data
+			}
+			time.Sleep(1*time.Millisecond)
+		}
+	}()
+	
+	
+	for{
+		state, master_adress, elevator_nr := stateInit(master_ip_reader)	
+		global_order_list = backup
+		connections := make([]net.Conn,10)
+		nr_of_slaves := 0
+		
+ 		if(state == "master"){	
+ 			fmt.Println("This elevator is a master") 
+ 			elevator_number <- elevator_nr
+ 		}
+ 		
+ 		for (state=="master"){
+			//Broadcasting own ip
+			master_ip_writer.Write([]byte(ip+"\x00")) 
+
+			//If the master has no slaves there either exists another master or there are no slaves on the network
+			if(nr_of_slaves == 0){
+				if checkConnection(master_ip_reader, ip) == -1{
+					order_queue_array[local_index] = global_order_list
+					backup = global_order_list
+					fmt.Println("Unexpected error: Another master on the net. Reassigning elevator state")
+					break 
+				} 
+			}
+			
+			//Listens for slaves. 
+			slave_listener, err := slaveListener(master_port)
+			slave_listener.SetDeadline(time.Now().Add(1500*time.Millisecond))
+			connections[nr_of_slaves],err = slave_listener.Accept()
+			if err != nil{
+				//time.Sleep(time.Millisecond)
+			}else{
+				nr := strconv.Itoa(nr_of_slaves + 2)
+				connections[nr_of_slaves].Write([]byte(nr+"\x00"))  
+				nr_of_slaves = nr_of_slaves + 1
+				fmt.Println("This elevator is a master and has ", nr_of_slaves, "slaves")
+   			}
+   			
+			i := 0
+			buffer := make([]byte, 128)
+			var n int
+			for i < nr_of_slaves {
+				connections[i].SetDeadline(time.Now().Add(100*time.Millisecond))
+				_, err := connections[i].Write([]byte("send\x00"))
+				
+				//error handling
+				if err != nil{
+					connection_timeouts[i] += 1
+					if (connection_timeouts[i] > 3){
+						fmt.Println("connection timeout for slave: ", i)
+						connections[i].Close()
+						j := i
+						k := nr_of_slaves
+						for j < k{
+							connections[j] = connections[j+1]
+							if(j < nr_of_slaves -1){
+								connections[j].SetDeadline(time.Now().Add(1*time.Second))
+								_, err1 := connections[j].Write([]byte("decr\x00"))
+								if(err1 != nil){
+									fmt.Println("error updating connection list")
+									continue 
+								}
+							}
+							j += 1 
+						}
+						fmt.Println("Slave number: ", i+1, "is inactive, teminating connection")
+						connection_timeouts[i] = 0
+						nr_of_slaves-= 1
+					}
+					continue
+				// error handling done 
+				}else{
+					connections[i].SetDeadline(time.Now().Add(100*time.Millisecond))
+					n, err = connections[i].Read(buffer)
+				}
+				var information informationPkg
+				err = json.Unmarshal(buffer[0:n], &information)
+				
+				//error handling
+				if (err != nil){
+					fmt.Println("Error unpacking informationPkg: ", err)
+					connection_timeouts[i] += 1
+					if connection_timeouts[i] > 3{
+						fmt.Println("Too many faulty packages from slave, terminating connection")
+						connections[i].Close()
+						j := i
+						k := nr_of_slaves
+						for j < k{
+							connections[j] = connections[j+1]
+							if(j < nr_of_slaves -1){
+								connections[j].SetDeadline(time.Now().Add(1*time.Second))
+								_, err1 := connections[j].Write([]byte("decr\x00"))
+								if(err1 != nil){
+									fmt.Println("error updating connection list")
+									continue 
+								}
+							}
+							
+							j += 1 
+						}
+						connection_timeouts[i] = 0
+						nr_of_slaves -= 1
+					}
+					//no continue here, disregarding elevator i until next order distribution
+				//error handling done			
+				}else{
+					cost_array[i+1].Array = information.Cost
+					order_queue_array[i+1].Array = information.OrderQueue
+					remove_order_array[i+1].Array = information.RemoveOrder
+				}	
+				i += 1
+			}
+			
+			//Assigning orders
+			global_order_list = calculateOrderList(remove_order_array, order_queue_array, cost_array, global_order_list, nr_of_slaves)
+			
+			//Clearing arrays
+			i= 0
+			for i<= nr_of_slaves{
+				remove_order_array[i] = driver.DataInit()
+				order_queue_array[i] = driver.DataInit()
+				i += 1
+			}
+			
+			//broadcasting new orders
+			buffer, err = json.Marshal(global_order_list)
+			if (err!=nil){
+				fmt.Println("error converting order_list to type driver.Data: ", err)
+			}else{
+				broadcast_orders.Write(buffer) 
+				order_list <- global_order_list
+				order_list_lights <- global_order_list
+			}
+			
+			time.Sleep(10*time.Millisecond)	
+		}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+// Attempting to connect to a master, will try to initialize state again if it fails (next iteration of outer for loop)
+ 		if state == "slave" {
+			connections[master_index],err = connectMaster(master_adress + master_port)
+			if err != nil{
+				fmt.Println("Cannot connect to master: ", err);
+				continue
+			}
+			buffer := make([]byte,128)
+			connections[master_index].Read(buffer)
+			read_msg := string(buffer)
+			elevator_nr_str := strings.Split(read_msg, "\x00")[0]		
+			elevator_nr,_ = strconv.Atoi(elevator_nr_str)
+			fmt.Println("The elevator is a slave and has been assigned number:",elevator_nr)
+			elevator_number <- elevator_nr  	
+		}
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////					
+//		Slave loop
+		for state == "slave"{
+			buffer := make([]byte, 128)
+			connections[master_index].SetDeadline(time.Now().Add(1500*time.Millisecond))
+			_, err := connections[master_index].Read(buffer)
+		
+			read_msg:=string(buffer)
+			if strings.Split(read_msg, "\x00")[0]	 == "send"{
+				connection_timeouts[master_index] = 0	
+				pkg.Cost = cost_array[local_index].Array
+				pkg.OrderQueue = order_queue_array[local_index].Array
+				pkg.RemoveOrder = remove_order_array[local_index].Array
+				buffer = make([]byte, 128)
+				buffer,err = json.Marshal(pkg)
+				
+				if err != nil{
+					fmt.Println("Error packing informationPkg: ", err)
+				}else{ 
+					connections[master_index].Write(buffer)
+					order_queue_array[master_index] = driver.DataInit()
+					remove_order_array[master_index] = driver.DataInit()
+				}				
+				
+				n, err := recieve_orders.Read(buffer)
+				var new_orders driver.Data 
+				err = json.Unmarshal(buffer[0:n], &new_orders) 
+				
+				if (err != nil){
+					fmt.Println("Error unpacking data (New orders): ", err)
+				}else{
+					global_order_list = new_orders
+					order_list_lights <- global_order_list 
+					order_list <-global_order_list
+				}			
+			}else if strings.Split(read_msg, "\x00")[0]	 == "decr"{
+				elevator_nr -= 1
+				fmt.Println("The elevator has been assigned number",elevator_nr)
+				elevator_number <- elevator_nr
+			}else if err != nil{
+				connection_timeouts[master_index] += 1
+				fmt.Println("Connections timeout: ", err)
+				if connection_timeouts[master_index] > 3{
+					connection_timeouts[master_index] = 0
+					fmt.Println("Too many connection timeouts, terminating connection to master")
+					connections[master_index].Close()
+					order_queue_array[local_index] = global_order_list
+					break
+				}
+			}
+			
+			
+			time.Sleep(1*time.Millisecond)
+		}
+		time.Sleep(100*time.Millisecond)	
+	}
+}
+ 
+ 
+//		initializes the pc's ip adress, standard master port and the UDP broadcast connections used 
+func Init()(string, string, *net.UDPConn,*net.UDPConn,*net.UDPConn,*net.UDPConn, error) {
+	AllAddr, err := net.InterfaceAddrs()
+	if err != nil{
+		fmt.Println("couldn't find ip")
+	}
+	
+	//Finds the ip, uses a predefined port as the default connection port. 
+	ip := strings.Split(AllAddr[1].String(),"/")[0]
+	port := ":33546"
+	
+	l_adress, err := net.ResolveUDPAddr("udp", ":20008")
+	listen, err := net.ListenUDP("udp",l_adress)
+
+	w_adress, err := net.ResolveUDPAddr("udp", "129.241.187.255"+":20008")
+	conn, err := net.DialUDP("udp",nil,w_adress)
+	
+	l_adress, err = net.ResolveUDPAddr("udp", ":20009")
+	recieve_orders, err := net.ListenUDP("udp",l_adress)
+
+	w_adress, err = net.ResolveUDPAddr("udp", "129.241.187.255"+":20009")
+	broadcast_orders, err := net.DialUDP("udp",nil,w_adress)
+	
+	return ip, port, listen, conn, broadcast_orders, recieve_orders, err
+
+
+}
+
+//			initializes/reset state, resets/initialize number of slaves, and initialize master-ip, initialize connections array		
+func stateInit(conn *net.UDPConn)(string, string, int){
+	buffer := make([]byte,128)
+	fmt.Println("Searching for master, please wait...")
+	
+	conn.SetDeadline(time.Now().Add(6*time.Second))
+	_,err := conn.Read(buffer)
+	
+	//No master found, network sets state to master
+	if err != nil{
+		fmt.Println("No master online.", err )			
+		return "master", "", 1
+	}
+	// A master is found, network sets state to slave.  
+	read_ip:=string(buffer)
+    master_ip:= strings.Split(read_ip, "\x00")[0]
+    fmt.Println("Master detected at ip: ", master_ip)
+	return "slave", master_ip, -1
+	
+}
+
+//		Listens for slaves and returns the slave connection
+func slaveListener(port string)(*net.TCPListener, error){
+	listen_adress, err := net.ResolveTCPAddr("tcp", port)
+	slave_listener, err := net.ListenTCP("tcp", listen_adress)
+	return slave_listener, err
+}
+
+// 		attempts to connect to the given adress
+func connectMaster(adress string)(*net.TCPConn, error){
+	master_adr, err :=  net.ResolveTCPAddr("tcp", adress)
+	conn, err := net.DialTCP("tcp", nil, master_adr)
+	return conn, err
+}
+
+
+func checkConnection(master_ip_reader *net.UDPConn, ip string)(int){
+	buffer := make([]byte, 128)
+	var read_ip string	
+	master_ip_reader.SetDeadline(time.Now().Add(200*time.Millisecond))		
+	_,err := master_ip_reader.Read(buffer)
+	if err != nil{
+		return 0
+	}
+	read_ip =string(buffer)
+   master_ip_r:= strings.Split(read_ip, "\x00")[0]
+	if master_ip_r != ip{
+			return -1
+	}
+	return 1
+ 
+}
+
+
+func calculateOrderList(remove_order_array [10]driver.Data, order_queue_array [10]driver.Data, cost_array[10]driver.Data, order_list driver.Data, nr_of_slaves int)(driver.Data){
+	i := 0
+	j := 0
+	for i <= nr_of_slaves{
+		j = 0
+		for j<driver.N_FLOORS*2{
+			if(order_queue_array[i].Array[j] == 1){
+				order_list.Array[j] = 1
+				order_queue_array[i].Array[j] = 0
+			}
+			j += 1
+		}
+		j = 0
+		for j <driver.N_FLOORS*2{
+			if(remove_order_array[i].Array[j] == 1){
+				order_list.Array[j] = 0
+				remove_order_array[i].Array[j] = 0
+			}
+			j += 1
+		}
+		i += 1
+	}
+	j = 0
+	var lowest_cost [8]int
+	for j<driver.N_FLOORS*2{
+		i = 0
+		lowest_cost[j] = 0
+		for i <= nr_of_slaves{
+			if(cost_array[i].Array[j] < cost_array[lowest_cost[j]].Array[j]){
+				lowest_cost[j] = i
+			}
+			i += 1
+		}
+		j += 1
+	}
+	
+	j = 0
+	for j<driver.N_FLOORS*2{ 
+		if order_list.Array[j] != 0{	
+			order_list.Array[j] = ((lowest_cost[j] + 1))  // 0 to (nr_of_slaves +1) based on the elevator with lowest cost. 
+		}else{
+			order_list.Array[j] = 0
+		}
+		j += 1
+	}
+	
+	return order_list
+
+}
+
